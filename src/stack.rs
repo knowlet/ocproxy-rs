@@ -310,12 +310,10 @@ impl Driver {
             .unwrap_or(Duration::from_secs(3600));
         // ENOBUFS uses a timer because writable readiness may remain set. Other
         // blocked sends use readiness. Do not spin on an immediate egress deadline.
-        let delay = if delay.is_zero() && self.send_retry_at.is_some() {
-            self.send_retry_at.unwrap().saturating_duration_since(now)
-        } else if self.device.tx.len() == PACKET_QUEUE && delay.is_zero() {
-            Duration::from_secs(1)
-        } else {
-            delay.max(Duration::from_millis(1))
+        let delay = match (delay.is_zero(), self.send_retry_at) {
+            (true, Some(retry)) => retry.saturating_duration_since(now),
+            (true, None) if self.device.tx.len() == PACKET_QUEUE => Duration::from_secs(1),
+            _ => delay.max(Duration::from_millis(1)),
         };
         let mut deadline = now + delay;
         if let Some(retry) = self.send_retry_at {
