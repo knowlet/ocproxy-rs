@@ -969,13 +969,26 @@ mod tests {
         }
         let (socket, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
         socket.set_nonblocking(true).unwrap();
-        loop {
+        let mut blocked = false;
+        for _ in 0..65_536 {
             match socket.send(&[0; 1400]) {
                 Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    blocked = true;
+                    break;
+                }
+                // Darwin reports a full UNIX datagram peer queue as ENOBUFS,
+                // rather than EAGAIN. This is only a test-setup condition;
+                // production packet-send errors retain their existing handling.
+                #[cfg(target_os = "macos")]
+                Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => {
+                    blocked = true;
+                    break;
+                }
                 Err(error) => panic!("could not fill transport: {error}"),
             }
         }
+        assert!(blocked, "transport did not saturate within the setup limit");
         let (network, mut driver) =
             new(UnixDatagram::from_std(socket).unwrap(), test_config()).unwrap();
         for _ in 0..PACKET_QUEUE {
