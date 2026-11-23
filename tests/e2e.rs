@@ -236,6 +236,12 @@ struct Proxy {
 
 impl Proxy {
     fn start(mode: Mode) -> Self {
+        Self::start_with(mode, |command| {
+            command.args(["--connect-timeout", "3", "--handshake-timeout", "3"]);
+        })
+    }
+
+    fn start_with(mode: Mode, customize: impl Fn(&mut Command)) -> Self {
         for attempt in 0..5 {
             // Keep the ephemeral port reserved until immediately before spawn.
             // Retry a genuine address-in-use race instead of making CI flaky.
@@ -249,8 +255,7 @@ impl Proxy {
             let mut command = binary_command();
             command
                 .env("INTERNAL_IP4_ADDRESS", CLIENT_IP.to_string())
-                .env("INTERNAL_IP4_MTU", "1400")
-                .args(["--connect-timeout", "3", "--handshake-timeout", "3"]);
+                .env("INTERNAL_IP4_MTU", "1400");
             match mode {
                 Mode::Forward => {
                     command.args([
@@ -266,6 +271,7 @@ impl Proxy {
                 command.env("INTERNAL_IP4_DNS", DNS_IP.to_string());
                 command.env("CISCO_DEF_DOMAIN", "unit.test");
             }
+            customize(&mut command);
             inherit_fd(&mut command, child_socket.as_raw_fd());
             drop(reservation);
             let mut process = Process::spawn(&mut command);
@@ -286,7 +292,13 @@ impl Proxy {
     }
 
     fn connect(&self) -> TcpStream {
-        let stream = TcpStream::connect_timeout(&self.listen, IO_TIMEOUT).unwrap();
+        self.connect_within(IO_TIMEOUT)
+    }
+
+    fn connect_within(&self, timeout: Duration) -> TcpStream {
+        assert!(!timeout.is_zero(), "connect deadline already passed");
+        let stream = TcpStream::connect_timeout(&self.listen, timeout)
+            .unwrap_or_else(|error| panic!("connect failed after {timeout:?}: {error}"));
         stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
         stream.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
         stream.set_nodelay(true).unwrap();
@@ -322,6 +334,103 @@ fn socks_ip_keeps_pipelined_data_and_delivers_response_after_half_close() {
 #[test]
 fn socks_name_resolves_using_vpn_dns_and_default_domain() {
     exercise_proxy(Mode::SocksDomain);
+}
+
+#[test]
+fn descriptor_exhaustion_pauses_accept_without_stopping_the_proxy() {
+    const LIMIT: libc::rlim_t = 64;
+    // socks::handshake is one timeout from accept until the CONNECT request is
+    // read. Accept cannot precede `started` below. Opening the extra clients
+    // and waiting for the exhaustion log share a deadline SETUP_SLACK before
+    // that timeout, so the control client is still inside the handshake when
+    // its CONNECT is written.
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+    const SETUP_SLACK: Duration = Duration::from_secs(2);
+    let handshake_timeout = HANDSHAKE_TIMEOUT.as_secs().to_string();
+    let mut proxy = Proxy::start_with(Mode::SocksIp, |command| {
+        command.args([
+            "--connect-timeout",
+            "3",
+            "--handshake-timeout",
+            &handshake_timeout,
+        ]);
+        // SAFETY: After fork the closure calls only async-signal-safe setrlimit
+        // with a local struct and reads errno on error. It lowers the child only.
+        unsafe {
+            command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: LIMIT,
+                    rlim_max: LIMIT,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    });
+    let started = Instant::now();
+    let setup_deadline = started + HANDSHAKE_TIMEOUT - SETUP_SLACK;
+    // A client accepted before exhaustion must keep being served.
+    let mut existing = proxy.connect_within(
+        setup_deadline
+            .saturating_duration_since(Instant::now())
+            .min(IO_TIMEOUT),
+    );
+    existing.write_all(&[5, 1, 0]).unwrap();
+    let mut selection = [0; 2];
+    existing.read_exact(&mut selection).unwrap();
+    assert_eq!(selection, [5, 0]);
+    assert!(
+        Instant::now() < setup_deadline,
+        "method exchange consumed the handshake budget"
+    );
+    // Each idle SOCKS client holds one proxy descriptor until its handshake
+    // timeout, so more clients than the limit force accept(2) to fail.
+    let held: Vec<TcpStream> = (0..LIMIT as usize + 16)
+        .map(|_| {
+            let remaining = setup_deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "opening clients exceeded the handshake budget"
+            );
+            proxy.connect_within(remaining)
+        })
+        .collect();
+    while !proxy.process.logs().contains("cannot accept") {
+        assert!(
+            proxy.process.child.try_wait().unwrap().is_none(),
+            "proxy exited on descriptor exhaustion: {}",
+            proxy.process.logs()
+        );
+        let remaining = setup_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "descriptor limit was not reached before the control client's handshake timeout: {}",
+            proxy.process.logs()
+        );
+        thread::sleep(Duration::from_millis(10).min(remaining));
+    }
+    assert!(
+        Instant::now() < started + HANDSHAKE_TIMEOUT,
+        "CONNECT would be written after the handshake timeout"
+    );
+    let mut request = vec![5, 1, 0, 1];
+    request.extend(SERVICE_IP.octets());
+    request.extend(SERVICE_PORT.to_be_bytes());
+    existing.write_all(&request).unwrap();
+    let syn = tcp_segment(receive_ip(&proxy.tunnel, Instant::now() + IO_TIMEOUT));
+    assert_eq!(syn.flags & SYN, SYN, "existing client was not served");
+    assert_eq!(*syn.destination.ip(), SERVICE_IP);
+    drop(held);
+    // Connections that waited in the backlog and new ones are served again.
+    let mut client = proxy.connect();
+    client.write_all(&[5, 1, 0]).unwrap();
+    client.read_exact(&mut selection).unwrap();
+    assert_eq!(selection, [5, 0]);
+    let logs = proxy.process.logs();
+    assert!(!logs.contains("listener failed"), "{logs}");
+    proxy.process.hangup();
 }
 
 fn exercise_proxy(mode: Mode) {

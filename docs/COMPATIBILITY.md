@@ -87,7 +87,7 @@ accepted. The VPN source address needs at least one configured IP family.
 Up to eight distinct DNS-server addresses are accepted from the environment.
 Each server must have a matching VPN source-address family. Explicit `-d`
 arguments replace the environment's server list. The default MTU is 1400;
-accepted values are 576 through 65535, with a minimum of 1280 when IPv6 is
+accepted values are 68 (the IPv4 minimum) through 65535, with a minimum of 1280 when IPv6 is
 configured. These defaults and validation choices are specific to this
 implementation, not claims about undocumented ocproxy behavior.
 

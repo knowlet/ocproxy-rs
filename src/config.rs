@@ -98,6 +98,12 @@ pub struct Config {
     pub handshake_timeout: Duration,
 }
 
+/// The IPv4 minimum MTU (RFC 791). OpenConnect derives the tunnel MTU from the
+/// gateway MTU minus its encapsulation overhead, which can fall below 576.
+pub const MIN_MTU: usize = 68;
+/// The IPv6 minimum link MTU (RFC 8200).
+pub const MIN_IPV6_MTU: usize = 1280;
+
 impl Cli {
     pub fn config(&self) -> Result<Config> {
         self.config_with_env(|key| std::env::var(key).ok())
@@ -156,12 +162,12 @@ impl Cli {
                 .unwrap_or(1400),
         };
         ensure!(
-            (576..=65535).contains(&mtu),
-            "MTU must be between 576 and 65535"
+            (MIN_MTU..=65535).contains(&mtu),
+            "MTU must be between {MIN_MTU} and 65535"
         );
         ensure!(
-            ipv6.is_none() || mtu >= 1280,
-            "IPv6 requires an MTU of at least 1280"
+            ipv6.is_none() || mtu >= MIN_IPV6_MTU,
+            "IPv6 requires an MTU of at least {MIN_IPV6_MTU}"
         );
         let dns_servers = if self.dns.is_empty() {
             let mut servers = Vec::new();
@@ -471,6 +477,23 @@ mod tests {
         assert_eq!(cfg.listeners[0].bind.to_string(), "127.0.0.1:1080");
         assert_eq!(cfg.network.mtu, 1400);
         assert!(cfg.network.dns_servers.is_empty());
+    }
+    #[test]
+    fn accepts_small_openconnect_mtus_down_to_the_ipv4_minimum() {
+        for (mtu, accepted) in [("574", true), ("68", true), ("67", false), ("65536", false)] {
+            let env = [ENV[0], ENV[1], ("INTERNAL_IP4_MTU", mtu)];
+            let result = config(&["-D", "1080"], &env);
+            assert_eq!(result.is_ok(), accepted, "MTU {mtu}: {result:?}");
+            if accepted {
+                assert_eq!(result.unwrap().network.mtu, mtu.parse::<usize>().unwrap());
+            }
+        }
+        let env = [
+            ENV[0],
+            ("INTERNAL_IP6_ADDRESS", "fd00::2"),
+            ("INTERNAL_IP4_MTU", "1279"),
+        ];
+        assert!(config(&["-D", "1080"], &env).is_err());
     }
     #[test]
     fn explicit_bind_overrides_remote_default() {
