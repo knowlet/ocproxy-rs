@@ -236,6 +236,10 @@ struct Proxy {
 
 impl Proxy {
     fn start(mode: Mode) -> Self {
+        Self::start_with(mode, |_| {})
+    }
+
+    fn start_with(mode: Mode, customize: impl Fn(&mut Command)) -> Self {
         for attempt in 0..5 {
             // Keep the ephemeral port reserved until immediately before spawn.
             // Retry a genuine address-in-use race instead of making CI flaky.
@@ -266,6 +270,7 @@ impl Proxy {
                 command.env("INTERNAL_IP4_DNS", DNS_IP.to_string());
                 command.env("CISCO_DEF_DOMAIN", "unit.test");
             }
+            customize(&mut command);
             inherit_fd(&mut command, child_socket.as_raw_fd());
             drop(reservation);
             let mut process = Process::spawn(&mut command);
@@ -322,6 +327,54 @@ fn socks_ip_keeps_pipelined_data_and_delivers_response_after_half_close() {
 #[test]
 fn socks_name_resolves_using_vpn_dns_and_default_domain() {
     exercise_proxy(Mode::SocksDomain);
+}
+
+#[test]
+fn descriptor_exhaustion_pauses_accept_without_stopping_the_proxy() {
+    const LIMIT: libc::rlim_t = 64;
+    let mut proxy = Proxy::start_with(Mode::SocksIp, |command| {
+        // SAFETY: After fork the closure calls only async-signal-safe setrlimit
+        // with a local struct and reads errno on error. It lowers the child only.
+        unsafe {
+            command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: LIMIT,
+                    rlim_max: LIMIT,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    });
+    // Each idle SOCKS client holds one proxy descriptor until its handshake
+    // timeout, so more clients than the limit force accept(2) to fail.
+    let held: Vec<TcpStream> = (0..LIMIT as usize + 16).map(|_| proxy.connect()).collect();
+    let deadline = Instant::now() + IO_TIMEOUT;
+    while !proxy.process.logs().contains("cannot accept") {
+        assert!(
+            proxy.process.child.try_wait().unwrap().is_none(),
+            "proxy exited on descriptor exhaustion: {}",
+            proxy.process.logs()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "descriptor limit was not reached: {}",
+            proxy.process.logs()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    drop(held);
+    // Connections that waited in the backlog and new ones are served again.
+    let mut client = proxy.connect();
+    client.write_all(&[5, 1, 0]).unwrap();
+    let mut selection = [0; 2];
+    client.read_exact(&mut selection).unwrap();
+    assert_eq!(selection, [5, 0]);
+    let logs = proxy.process.logs();
+    assert!(!logs.contains("listener failed"), "{logs}");
+    proxy.process.hangup();
 }
 
 fn exercise_proxy(mode: Mode) {

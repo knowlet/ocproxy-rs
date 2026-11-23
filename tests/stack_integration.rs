@@ -239,6 +239,141 @@ async fn cancelled_connect_releases_limit_and_source_port() {
 }
 
 #[tokio::test]
+async fn time_wait_does_not_hold_the_last_connection_slot() {
+    let mut config = configuration();
+    config.max_connections = 1;
+    let (network, peer, driver) = launch(config);
+    let remote: SocketAddr = "10.20.0.42:7007".parse().unwrap();
+    let connecting = tokio::spawn({
+        let network = network.clone();
+        async move { network.connect(Target::Ip(remote)).await }
+    });
+    let syn = receive(&peer).await;
+    let (local, remote, segment) = endpoints(&syn);
+    assert_eq!(segment[13] & 2, 2);
+    let mut next = u32_at(segment, 4).wrapping_add(1);
+    let server_seq: u32 = 0x5000;
+    peer.send(&tcp(remote, local, server_seq, next, 0x12, &[]))
+        .await
+        .unwrap();
+    let mut connection = connecting.await.unwrap().unwrap();
+    // The local client closes first, so this stack performs the active close.
+    connection.stream.write_all(b"bye").await.unwrap();
+    connection.stream.shutdown().await.unwrap();
+    loop {
+        let packet = receive(&peer).await;
+        let segment = endpoints(&packet).2;
+        let data = &segment[usize::from(segment[12] >> 4) * 4..];
+        if u32_at(segment, 4) == next {
+            next = next.wrapping_add(data.len() as u32);
+            if segment[13] & 1 != 0 {
+                next = next.wrapping_add(1);
+                break;
+            }
+        }
+    }
+    // ACK the request and FIN, then close the peer side too.
+    peer.send(&tcp(remote, local, server_seq + 1, next, 0x11, &[]))
+        .await
+        .unwrap();
+    loop {
+        let segment = endpoints(&receive(&peer).await).2.to_vec();
+        if u32_at(&segment, 8) == server_seq + 2 {
+            break;
+        }
+    }
+    let mut rest = Vec::new();
+    timeout(
+        Duration::from_secs(2),
+        connection.stream.read_to_end(&mut rest),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(rest.is_empty());
+    drop(connection);
+    // The first connection is now in TIME-WAIT. A new connection must open
+    // immediately rather than fail with the limit for TIME-WAIT's duration.
+    let mut next_connect = tokio::spawn({
+        let network = network.clone();
+        async move { network.connect(Target::Ip(remote)).await }
+    });
+    let syn = tokio::select! {
+        packet = receive(&peer) => packet,
+        result = &mut next_connect => panic!("second connect ended without a SYN: {result:?}"),
+    };
+    let (second_local, _, segment) = endpoints(&syn);
+    assert_eq!(
+        segment[13] & 0x12,
+        2,
+        "second connection did not send a SYN"
+    );
+    assert_ne!(second_local, local);
+    next_connect.abort();
+    driver.abort();
+}
+
+/// OpenConnect reported MTU 574 for an ocserv gateway configured with MTU 640.
+/// A peer that omits the MSS option implies 536 bytes (RFC 9293), which would
+/// exceed this tunnel; every emitted datagram must still fit the VPN MTU.
+#[tokio::test]
+async fn small_openconnect_mtu_bounds_every_emitted_packet() {
+    const MTU: usize = 574;
+    let mut config = configuration();
+    config.mtu = MTU;
+    let (network, peer, driver) = launch(config);
+    let connecting = tokio::spawn({
+        let network = network.clone();
+        async move {
+            network
+                .connect(Target::Ip("10.20.0.42:8080".parse().unwrap()))
+                .await
+        }
+    });
+    let syn = receive(&peer).await;
+    assert!(syn.len() <= MTU);
+    let (local, remote, segment) = endpoints(&syn);
+    let options = &segment[20..usize::from(segment[12] >> 4) * 4];
+    let mss = options
+        .windows(4)
+        .find(|option| option[0] == 2 && option[1] == 4)
+        .map(|option| u16::from_be_bytes([option[2], option[3]]))
+        .expect("SYN carries an MSS option");
+    assert_eq!(usize::from(mss), MTU - 40);
+    let mut next = u32_at(segment, 4).wrapping_add(1);
+    let server_seq: u32 = 0x9000;
+    peer.send(&tcp(remote, local, server_seq, next, 0x12, &[]))
+        .await
+        .unwrap();
+    let mut connection = connecting.await.unwrap().unwrap();
+    let request: Vec<u8> = (0..6000).map(|index| index as u8).collect();
+    connection.stream.write_all(&request).await.unwrap();
+    let mut received = Vec::<u8>::new();
+    let mut largest = 0;
+    while received.len() < request.len() {
+        let packet = receive(&peer).await;
+        assert!(
+            packet.len() <= MTU,
+            "{} byte datagram exceeds MTU",
+            packet.len()
+        );
+        largest = largest.max(packet.len());
+        let segment = endpoints(&packet).2;
+        let data = &segment[usize::from(segment[12] >> 4) * 4..];
+        if u32_at(segment, 4) == next {
+            received.extend(data);
+            next = next.wrapping_add(data.len() as u32);
+        }
+        peer.send(&tcp(remote, local, server_seq + 1, next, 0x10, &[]))
+            .await
+            .unwrap();
+    }
+    assert_eq!(received, request);
+    assert_eq!(largest, MTU, "full-sized segments should fill the MTU");
+    driver.abort();
+}
+
+#[tokio::test]
 async fn silent_peer_obeys_connect_deadline() {
     let mut config = configuration();
     config.connect_timeout = Duration::from_millis(100);

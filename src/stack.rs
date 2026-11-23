@@ -199,7 +199,9 @@ fn validate_config(config: &NetworkConfig) -> io::Result<()> {
     {
         return Err(invalid("VPN addresses must be unicast"));
     }
-    if !(576..=MAX_DATAGRAM).contains(&config.mtu) || (config.ipv6.is_some() && config.mtu < 1280) {
+    if !(crate::config::MIN_MTU..=MAX_DATAGRAM).contains(&config.mtu)
+        || (config.ipv6.is_some() && config.mtu < crate::config::MIN_IPV6_MTU)
+    {
         return Err(invalid("invalid VPN MTU"));
     }
     if !(1..=4096).contains(&config.max_connections)
@@ -397,7 +399,9 @@ impl Driver {
         if reply.is_closed() {
             return;
         }
-        if self.flows.len() + self.resolutions.len() >= self.config.max_connections {
+        if self.flows.len() + self.resolutions.len() >= self.config.max_connections
+            && !self.reclaim_time_wait()
+        {
             let _ = reply.send(Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "VPN connection limit reached",
@@ -464,6 +468,28 @@ impl Driver {
                 });
             }
         }
+    }
+
+    /// A connection we closed first stays in TIME-WAIT for smoltcp's fixed 10 s.
+    /// It has delivered everything to its client but still holds a connection
+    /// slot and its buffers. At the limit, release the earliest-opened such
+    /// connection instead of refusing new work, as lwIP does. The total socket
+    /// count and memory bound are unchanged; the peer has already closed.
+    fn reclaim_time_wait(&mut self) -> bool {
+        let sockets = &self.sockets;
+        let Some(index) = self.flows.iter().position(|flow| {
+            let socket = sockets.get::<tcp::Socket>(flow.handle);
+            flow.reply.is_none()
+                && flow.remote_eof
+                && socket.state() == tcp::State::TimeWait
+                && !socket.can_recv()
+        }) else {
+            return false;
+        };
+        let flow = self.flows.remove(index);
+        self.sockets.remove(flow.handle);
+        self.used_ports.remove(&flow.local_addr.port());
+        true
     }
 
     fn resolve(&mut self, cx: &mut Context<'_>, now: Instant) {

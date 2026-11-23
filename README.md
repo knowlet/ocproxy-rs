@@ -105,7 +105,7 @@ The commands above must run as an OpenConnect script with its inherited `VPNFD` 
 
 At least one listener and one VPN address are required. Ports must be nonzero. Bind addresses must be IP literals. IPv6 addresses in listener and forwarding expressions require brackets.
 
-The MTU is validated between 576 and 65535 bytes, with a minimum of 1280 when the VPN has IPv6. At most eight VPN DNS servers and 64 listeners are accepted. DNS-server address families must be configured on the VPN interface. Configuration limits bound connection count, packet queues, and relay memory; oversized configurations fail at startup.
+The MTU is validated between 68 (the IPv4 minimum) and 65535 bytes, with a minimum of 1280 when the VPN has IPv6. At most eight VPN DNS servers and 64 listeners are accepted. DNS-server address families must be configured on the VPN interface. Configuration limits bound connection count, packet queues, and relay memory; oversized configurations fail at startup.
 
 When enabled, the keepalive interval must be shorter than `--tcp-timeout`. The transport timeout bounds stalled TCP transfers and half-closed connections. Ordinary idle established connections remain open when keepalives are disabled.
 

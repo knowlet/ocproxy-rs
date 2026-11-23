@@ -9,8 +9,54 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::Semaphore,
     task::JoinSet,
-    time::timeout,
+    time::{Instant, sleep_until, timeout},
 };
+
+/// Pause accepting while the process or kernel is out of descriptors or memory.
+/// The pending connection stays in the listen backlog; existing clients continue.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+#[derive(Debug, PartialEq, Eq)]
+enum AcceptFailure {
+    /// Belongs to one incoming connection; accept the next one immediately.
+    Connection,
+    /// Resource exhaustion; retry after [`ACCEPT_BACKOFF`].
+    Resources,
+    /// The listener itself is unusable.
+    Listener,
+}
+
+fn classify_accept_error(error: &io::Error) -> AcceptFailure {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+    ) {
+        return AcceptFailure::Connection;
+    }
+    match error.raw_os_error() {
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => {
+            AcceptFailure::Resources
+        }
+        // accept(2) reports pending network errors of the new connection; Linux
+        // documents treating these like EAGAIN.
+        Some(
+            libc::EPROTO
+            | libc::ENOPROTOOPT
+            | libc::ENETDOWN
+            | libc::ENETUNREACH
+            | libc::EHOSTDOWN
+            | libc::EHOSTUNREACH
+            | libc::EOPNOTSUPP
+            | libc::ETIMEDOUT,
+        ) => AcceptFailure::Connection,
+        #[cfg(target_os = "linux")]
+        Some(libc::ENONET) => AcceptFailure::Connection,
+        _ => AcceptFailure::Listener,
+    }
+}
 
 pub struct BoundListener {
     pub listener: TcpListener,
@@ -42,10 +88,30 @@ pub async fn serve(
     connect_timeout: Duration,
 ) -> io::Result<()> {
     let mut clients = JoinSet::new();
+    let mut resume_at: Option<Instant> = None;
+    let mut exhausted = false;
     loop {
         tokio::select! {
-            accepted = bound.listener.accept() => {
-                let (stream, peer) = accepted?;
+            accepted = bound.listener.accept(), if resume_at.is_none() => {
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => match classify_accept_error(&error) {
+                        AcceptFailure::Connection => {
+                            tracing::debug!(%error, "incoming connection failed before accept");
+                            continue;
+                        }
+                        AcceptFailure::Resources => {
+                            if !exhausted {
+                                tracing::warn!(%error, "cannot accept; pausing listener while existing connections continue");
+                            }
+                            exhausted = true;
+                            resume_at = Some(Instant::now() + ACCEPT_BACKOFF);
+                            continue;
+                        }
+                        AcceptFailure::Listener => return Err(error),
+                    },
+                };
+                exhausted = false;
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
                     tracing::debug!(%peer, "connection limit reached");
                     drop(stream);
@@ -60,6 +126,8 @@ pub async fn serve(
                     }
                 });
             }
+            // The future is built even when disabled; it is polled only while paused.
+            () = sleep_until(resume_at.unwrap_or_else(Instant::now)), if resume_at.is_some() => resume_at = None,
             completed = clients.join_next(), if !clients.is_empty() => {
                 if let Some(Err(error)) = completed {
                     return Err(io::Error::other(format!("client task failed: {error}")));
@@ -132,5 +200,32 @@ mod tests {
             },
         ];
         assert!(bind_all(&specs).await.is_err());
+    }
+
+    #[test]
+    fn accept_errors_stop_only_a_broken_listener() {
+        let os = io::Error::from_raw_os_error;
+        for error in [
+            io::Error::from(io::ErrorKind::ConnectionAborted),
+            os(libc::ECONNABORTED),
+            os(libc::ECONNRESET),
+            os(libc::EINTR),
+            os(libc::EPROTO),
+            os(libc::ENETUNREACH),
+            os(libc::EHOSTUNREACH),
+            os(libc::ETIMEDOUT),
+        ] {
+            assert_eq!(
+                classify_accept_error(&error),
+                AcceptFailure::Connection,
+                "{error}"
+            );
+        }
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert_eq!(classify_accept_error(&os(code)), AcceptFailure::Resources);
+        }
+        for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK, libc::EFAULT] {
+            assert_eq!(classify_accept_error(&os(code)), AcceptFailure::Listener);
+        }
     }
 }
