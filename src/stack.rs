@@ -294,7 +294,13 @@ impl Driver {
             self.sockets.remove(handle);
             self.used_ports.remove(&port);
         }
-        if self.commands_closed && self.flows.is_empty() && self.resolutions.is_empty() {
+        // Finish only after queued packets, such as final resets, have been sent.
+        // A send error still ends the driver through flush_packets above.
+        if self.commands_closed
+            && self.flows.is_empty()
+            && self.resolutions.is_empty()
+            && self.device.tx.is_empty()
+        {
             return Poll::Ready(Ok(()));
         }
         if changed
@@ -1111,9 +1117,42 @@ mod tests {
         assert_eq!(counter.0.load(Ordering::Relaxed), 0);
     }
 
-    #[tokio::test]
+    struct WakeCounter(std::sync::atomic::AtomicUsize);
+    impl std::task::Wake for WakeCounter {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn wake_counter() -> (std::sync::Arc<WakeCounter>, std::task::Waker) {
+        let counter = std::sync::Arc::new(WakeCounter(Default::default()));
+        (counter.clone(), std::task::Waker::from(counter))
+    }
+
+    fn take_wakes(counter: &WakeCounter) -> usize {
+        counter.0.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Poll until the driver stops requesting an immediate repoll.
+    fn settle(driver: &mut Driver, cx: &mut Context<'_>, counter: &WakeCounter) {
+        for _ in 0..16 {
+            if take_wakes(counter) == 0 {
+                return;
+            }
+            assert!(driver.poll(cx).is_pending());
+        }
+        panic!("driver keeps waking itself");
+    }
+
+    // The paused clock makes the backoff independent of scheduling delays.
+    #[tokio::test(start_paused = true)]
     async fn send_backoff_keeps_timer_and_connect_cancellation_responsive() {
-        let (socket, _peer) = UnixDatagram::pair().unwrap();
+        let (socket, peer) = UnixDatagram::pair().unwrap();
+        // A nonblocking std socket reads the queue directly, without readiness.
+        let peer = peer.into_std().unwrap();
         let (_network, mut driver) = new(socket, test_config()).unwrap();
         let (reply, response) = oneshot::channel();
         driver.start(ConnectCommand {
@@ -1123,20 +1162,50 @@ mod tests {
         });
         assert_eq!(driver.flows.len(), 1);
         drop(response);
-        let retry = Instant::now() + SEND_RETRY_DELAY;
-        driver.send_retry_at = Some(retry);
+        driver.send_retry_at = Some(Instant::now() + SEND_RETRY_DELAY);
         driver.device.tx.push_back(vec![0; 20]);
-        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let (counter, waker) = wake_counter();
+        let mut cx = Context::from_waker(&waker);
         assert!(driver.poll(&mut cx).is_pending());
         assert!(
             driver.flows.is_empty(),
             "backoff must not defer cancellation"
         );
+        settle(&mut driver, &mut cx, &counter);
         assert_eq!(driver.device.tx.front().unwrap(), &vec![0; 20]);
+        assert!(peer.recv(&mut [0; 64]).is_err(), "sent before the deadline");
+        tokio::time::advance(SEND_RETRY_DELAY / 2).await;
+        assert_eq!(take_wakes(&counter), 0, "woke before the retry deadline");
+        tokio::time::advance(SEND_RETRY_DELAY / 2).await;
         assert!(
-            driver.timer.deadline() <= retry,
-            "retry must have a timer wake"
+            take_wakes(&counter) > 0,
+            "retry deadline must wake the driver"
         );
+        assert!(driver.poll(&mut cx).is_pending());
+        let mut packet = [0; 64];
+        assert_eq!(peer.recv(&mut packet).unwrap(), 20);
+        assert_eq!(&packet[..20], &[0; 20]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_packets_held_by_send_backoff() {
+        let (socket, peer) = UnixDatagram::pair().unwrap();
+        let peer = peer.into_std().unwrap();
+        let (network, mut driver) = new(socket, test_config()).unwrap();
+        drop(network);
+        driver.send_retry_at = Some(Instant::now() + SEND_RETRY_DELAY);
+        driver.device.tx.push_back(vec![0; 20]);
+        let (counter, waker) = wake_counter();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            driver.poll(&mut cx).is_pending(),
+            "driver finished with a queued packet"
+        );
+        settle(&mut driver, &mut cx, &counter);
+        tokio::time::advance(SEND_RETRY_DELAY).await;
+        assert!(take_wakes(&counter) > 0);
+        assert!(matches!(driver.poll(&mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(peer.recv(&mut [0; 64]).unwrap(), 20);
     }
 
     #[test]
