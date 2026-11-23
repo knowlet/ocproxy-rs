@@ -52,8 +52,9 @@ fn classify_accept_error(error: &io::Error) -> AcceptFailure {
             | libc::EOPNOTSUPP
             | libc::ETIMEDOUT,
         ) => AcceptFailure::Connection,
+        // Linux also reports EPERM when firewall rules reject one connection.
         #[cfg(target_os = "linux")]
-        Some(libc::ENONET) => AcceptFailure::Connection,
+        Some(libc::ENONET | libc::EPERM) => AcceptFailure::Connection,
         _ => AcceptFailure::Listener,
     }
 }
@@ -221,6 +222,11 @@ mod tests {
                 "{error}"
             );
         }
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            classify_accept_error(&os(libc::EPERM)),
+            AcceptFailure::Connection
+        );
         for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
             assert_eq!(classify_accept_error(&os(code)), AcceptFailure::Resources);
         }

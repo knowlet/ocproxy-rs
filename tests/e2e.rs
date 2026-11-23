@@ -348,6 +348,12 @@ fn descriptor_exhaustion_pauses_accept_without_stopping_the_proxy() {
             });
         }
     });
+    // A client accepted before exhaustion must keep being served.
+    let mut existing = proxy.connect();
+    existing.write_all(&[5, 1, 0]).unwrap();
+    let mut selection = [0; 2];
+    existing.read_exact(&mut selection).unwrap();
+    assert_eq!(selection, [5, 0]);
     // Each idle SOCKS client holds one proxy descriptor until its handshake
     // timeout, so more clients than the limit force accept(2) to fail.
     let held: Vec<TcpStream> = (0..LIMIT as usize + 16).map(|_| proxy.connect()).collect();
@@ -365,11 +371,17 @@ fn descriptor_exhaustion_pauses_accept_without_stopping_the_proxy() {
         );
         thread::sleep(Duration::from_millis(10));
     }
+    let mut request = vec![5, 1, 0, 1];
+    request.extend(SERVICE_IP.octets());
+    request.extend(SERVICE_PORT.to_be_bytes());
+    existing.write_all(&request).unwrap();
+    let syn = tcp_segment(receive_ip(&proxy.tunnel, Instant::now() + IO_TIMEOUT));
+    assert_eq!(syn.flags & SYN, SYN, "existing client was not served");
+    assert_eq!(*syn.destination.ip(), SERVICE_IP);
     drop(held);
     // Connections that waited in the backlog and new ones are served again.
     let mut client = proxy.connect();
     client.write_all(&[5, 1, 0]).unwrap();
-    let mut selection = [0; 2];
     client.read_exact(&mut selection).unwrap();
     assert_eq!(selection, [5, 0]);
     let logs = proxy.process.logs();

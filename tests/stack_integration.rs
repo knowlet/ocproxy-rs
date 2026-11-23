@@ -308,7 +308,25 @@ async fn time_wait_does_not_hold_the_last_connection_slot() {
         2,
         "second connection did not send a SYN"
     );
-    assert_ne!(second_local, local);
+    assert_ne!(
+        second_local.port(),
+        local.port(),
+        "a reclaimed TIME-WAIT port must stay reserved"
+    );
+    // If our final ACK was lost, the peer retransmits its FIN. With the
+    // TIME-WAIT state released, the reset ends the peer's LAST-ACK state.
+    peer.send(&tcp(remote, local, server_seq + 1, next, 0x11, &[]))
+        .await
+        .unwrap();
+    loop {
+        let packet = receive(&peer).await;
+        let (source, _, segment) = endpoints(&packet);
+        if source == local {
+            assert_eq!(segment[13] & 4, 4, "expected a reset for the old tuple");
+            break;
+        }
+        assert_eq!(source, second_local, "unexpected packet {segment:?}");
+    }
     next_connect.abort();
     driver.abort();
 }

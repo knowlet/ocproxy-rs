@@ -33,6 +33,9 @@ const WORK_BUDGET: usize = 32;
 const FIRST_EPHEMERAL: u16 = 49152;
 const EPHEMERAL_COUNT: u32 = 16384;
 const MAX_DATAGRAM: usize = 65_535;
+/// smoltcp's fixed TIME-WAIT duration. A reclaimed TIME-WAIT connection keeps
+/// its source port reserved this long so its tuple cannot be reused early.
+const TIME_WAIT: Duration = Duration::from_secs(10);
 
 /// A completed VPN TCP connection and its actual VPN-side local endpoint.
 #[derive(Debug)]
@@ -115,6 +118,8 @@ pub struct Driver {
     resolutions: Vec<Resolution>,
     flows: Vec<Flow>,
     used_ports: BTreeSet<u16>,
+    /// Ports of reclaimed TIME-WAIT connections, in expiry order.
+    quarantined_ports: VecDeque<(Instant, u16)>,
     epoch: Instant,
     timer: Pin<Box<Sleep>>,
     receive_buffer: Vec<u8>,
@@ -177,6 +182,7 @@ pub fn new(tunnel: UnixDatagram, config: NetworkConfig) -> io::Result<(Network, 
         resolutions: Vec::new(),
         flows: Vec::new(),
         used_ports: BTreeSet::new(),
+        quarantined_ports: VecDeque::new(),
         epoch,
         timer: Box::pin(sleep_until(epoch)),
         // One extra byte detects a truncated datagram even at the maximum MTU.
@@ -472,9 +478,12 @@ impl Driver {
 
     /// A connection we closed first stays in TIME-WAIT for smoltcp's fixed 10 s.
     /// It has delivered everything to its client but still holds a connection
-    /// slot and its buffers. At the limit, release the earliest-opened such
+    /// slot and its buffers. Only at the limit, release the earliest-opened such
     /// connection instead of refusing new work, as lwIP does. The total socket
-    /// count and memory bound are unchanged; the peer has already closed.
+    /// count and memory bound are unchanged. Its source port stays reserved for
+    /// the rest of TIME-WAIT, so a new connection cannot reuse the tuple. If the
+    /// peer lost our final ACK, its retransmitted FIN now gets a reset, which
+    /// ends its LAST-ACK state just as the ACK would have.
     fn reclaim_time_wait(&mut self) -> bool {
         let sockets = &self.sockets;
         let Some(index) = self.flows.iter().position(|flow| {
@@ -488,7 +497,8 @@ impl Driver {
         };
         let flow = self.flows.remove(index);
         self.sockets.remove(flow.handle);
-        self.used_ports.remove(&flow.local_addr.port());
+        self.quarantined_ports
+            .push_back((Instant::now() + TIME_WAIT, flow.local_addr.port()));
         true
     }
 
@@ -550,6 +560,14 @@ impl Driver {
     }
 
     fn allocate_port(&mut self) -> io::Result<u16> {
+        let now = Instant::now();
+        while let Some(&(expiry, port)) = self.quarantined_ports.front() {
+            if expiry > now {
+                break;
+            }
+            self.quarantined_ports.pop_front();
+            self.used_ports.remove(&port);
+        }
         let mut random = [0; 2];
         getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
         let start = u16::from_ne_bytes(random) as u32 % EPHEMERAL_COUNT;
@@ -928,6 +946,29 @@ mod tests {
         );
         assert!(qualify_name("", None).is_err());
         assert!(qualify_name(&"x".repeat(64), Some("corp.test")).is_err());
+    }
+
+    #[tokio::test]
+    async fn quarantined_port_is_not_reused_until_time_wait_expires() {
+        let (vpn, _peer) = UnixDatagram::pair().unwrap();
+        let (_network, mut driver) = new(vpn, test_config()).unwrap();
+        let reclaimed = FIRST_EPHEMERAL + 7;
+        driver.used_ports.insert(reclaimed);
+        driver
+            .quarantined_ports
+            .push_back((Instant::now() + TIME_WAIT, reclaimed));
+        let mut allocated = BTreeSet::new();
+        for _ in 1..EPHEMERAL_COUNT {
+            allocated.insert(driver.allocate_port().unwrap());
+        }
+        assert!(!allocated.contains(&reclaimed));
+        assert_eq!(
+            driver.allocate_port().unwrap_err().kind(),
+            io::ErrorKind::AddrNotAvailable
+        );
+        driver.quarantined_ports[0].0 = Instant::now();
+        assert_eq!(driver.allocate_port().unwrap(), reclaimed);
+        assert!(driver.quarantined_ports.is_empty());
     }
 
     #[test]
