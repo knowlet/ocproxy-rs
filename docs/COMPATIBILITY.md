@@ -62,7 +62,7 @@ configuration choice, not an access-control mechanism.
 | `INTERNAL_IP4_MTU` | Maximum IP packet size used by the stack. |
 | `INTERNAL_IP4_DNS` | Space-separated VPN DNS-server addresses; optional when only numeric destinations are used. |
 | `INTERNAL_IP6_DNS` | Space-separated IPv6 VPN DNS-server addresses; an extension to the original documented surface. |
-| `CISCO_DEF_DOMAIN` | Optional suffix for unqualified destination names. |
+| `CISCO_DEF_DOMAIN` | Optional suffix for unqualified destination names. When OpenConnect passes a space-separated list, the first entry is used. |
 | `INTERNAL_IP6_ADDRESS`, `--ipv6` | IPv6 address configuration, an extension to the original documented surface. |
 | `--vpn-fd` | Explicit override for the inherited descriptor number. |
 | `--connect-timeout` | Bound DNS/connection setup time. |

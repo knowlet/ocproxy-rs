@@ -198,15 +198,20 @@ impl Cli {
                 "DNS server {server} requires a VPN address of the same family"
             );
         }
-        let domain = self
-            .domain
-            .clone()
-            .or_else(|| env("CISCO_DEF_DOMAIN"))
-            .filter(|s| !s.is_empty())
-            .map(|s| s.trim_end_matches('.').to_owned());
+        // OpenConnect passes a gateway's default domains as one space-separated
+        // list, for example from ocserv `default-domain = corp.test lab.test`.
+        // The first entry is the default domain used for short names.
+        let domain = match &self.domain {
+            Some(domain) => Some(domain.clone()),
+            None => env("CISCO_DEF_DOMAIN")
+                .and_then(|list| list.split_whitespace().next().map(str::to_owned)),
+        }
+        .filter(|s| !s.is_empty());
         if let Some(domain) = &domain {
             ensure!(valid_hostname(domain), "invalid DNS domain suffix");
         }
+        // Validate before normalization: multiple root dots contain empty labels.
+        let domain = domain.map(|s| s.strip_suffix('.').unwrap_or(&s).to_owned());
         ensure!(
             (1..=3600).contains(&self.connect_timeout),
             "connect timeout must be 1..=3600 seconds"
@@ -399,6 +404,67 @@ mod tests {
             })
     }
     const ENV: &[(&str, &str)] = &[("VPNFD", "7"), ("INTERNAL_IP4_ADDRESS", "10.20.30.40")];
+    #[test]
+    fn rejects_empty_dns_labels_in_cli_and_environment_suffixes() {
+        for suffix in ["corp.test..", "corp.test...", ".", "..", "corp..test"] {
+            assert!(
+                config(&["-D", "1080", "-o", suffix], ENV).is_err(),
+                "CLI accepted {suffix}"
+            );
+            let mut env = ENV.to_vec();
+            env.push(("CISCO_DEF_DOMAIN", suffix));
+            assert!(
+                config(&["-D", "1080"], &env).is_err(),
+                "environment accepted {suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn uses_the_first_domain_of_an_openconnect_domain_list() {
+        let mut env = ENV.to_vec();
+        env.push(("CISCO_DEF_DOMAIN", "corp.test. lab.test other.test"));
+        let cfg = config(&["-D", "1080"], &env).unwrap();
+        assert_eq!(cfg.network.domain.as_deref(), Some("corp.test"));
+        env.pop();
+        env.push(("CISCO_DEF_DOMAIN", "corp.test.. lab.test"));
+        assert!(config(&["-D", "1080"], &env).is_err());
+        env.pop();
+        env.push(("CISCO_DEF_DOMAIN", "  "));
+        assert!(
+            config(&["-D", "1080"], &env)
+                .unwrap()
+                .network
+                .domain
+                .is_none()
+        );
+        // An explicit suffix is a single name, never a list.
+        assert!(config(&["-D", "1080", "-o", "corp.test lab.test"], ENV).is_err());
+    }
+
+    #[test]
+    fn normalizes_one_root_dot_and_preserves_empty_suffix_override() {
+        for suffix in ["corp.test", "corp.test.", "my_host."] {
+            let expected = suffix.strip_suffix('.').unwrap_or(suffix);
+            let cfg = config(&["-D", "1080", "-o", suffix], ENV).unwrap();
+            assert_eq!(cfg.network.domain.as_deref(), Some(expected));
+            let mut env = ENV.to_vec();
+            env.push(("CISCO_DEF_DOMAIN", suffix));
+            let cfg = config(&["-D", "1080"], &env).unwrap();
+            assert_eq!(cfg.network.domain.as_deref(), Some(expected));
+        }
+        let mut env = ENV.to_vec();
+        env.push(("CISCO_DEF_DOMAIN", "corp.test.."));
+        assert!(
+            config(&["-D", "1080", "-o", ""], &env)
+                .unwrap()
+                .network
+                .domain
+                .is_none()
+        );
+        assert!(config(&["-D", "1080", "-o", "valid.test."], &env).is_ok());
+    }
+
     #[test]
     fn defaults_are_local_and_dns_stays_explicit() {
         let cfg = config(&["-D", "1080"], ENV).unwrap();
