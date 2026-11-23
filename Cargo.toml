@@ -18,6 +18,10 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "sync", "
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+# Paused-clock tests for timer behaviour; same tokio version as above.
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

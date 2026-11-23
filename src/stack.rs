@@ -30,6 +30,7 @@ use crate::{Target, config::NetworkConfig};
 
 const PACKET_QUEUE: usize = 64;
 const WORK_BUDGET: usize = 32;
+const SEND_RETRY_DELAY: Duration = Duration::from_millis(10);
 const FIRST_EPHEMERAL: u16 = 49152;
 const EPHEMERAL_COUNT: u32 = 16384;
 const MAX_DATAGRAM: usize = 65_535;
@@ -123,6 +124,7 @@ pub struct Driver {
     epoch: Instant,
     timer: Pin<Box<Sleep>>,
     receive_buffer: Vec<u8>,
+    send_retry_at: Option<Instant>,
 }
 
 /// Construct a VPN stack. The caller must supply a connected, nonblocking UNIX
@@ -187,6 +189,7 @@ pub fn new(tunnel: UnixDatagram, config: NetworkConfig) -> io::Result<(Network, 
         timer: Box::pin(sleep_until(epoch)),
         // One extra byte detects a truncated datagram even at the maximum MTU.
         receive_buffer: vec![0; MAX_DATAGRAM + 1],
+        send_retry_at: None,
     };
     Ok((network, driver))
 }
@@ -299,7 +302,13 @@ impl Driver {
             self.sockets.remove(handle);
             self.used_ports.remove(&port);
         }
-        if self.commands_closed && self.flows.is_empty() && self.resolutions.is_empty() {
+        // Finish only after queued packets, such as final resets, have been sent.
+        // A send error still ends the driver through flush_packets above.
+        if self.commands_closed
+            && self.flows.is_empty()
+            && self.resolutions.is_empty()
+            && self.device.tx.is_empty()
+        {
             return Poll::Ready(Ok(()));
         }
         if changed
@@ -313,14 +322,17 @@ impl Driver {
             .poll_delay(self.stack_now(), &self.sockets)
             .map(Duration::from)
             .unwrap_or(Duration::from_secs(3600));
-        // When the VPN transport is blocked, readiness wakes us as soon as it
-        // can transmit. Do not spin on smoltcp's immediate egress deadline.
-        let delay = if self.device.tx.len() == PACKET_QUEUE && delay.is_zero() {
-            Duration::from_secs(1)
-        } else {
-            delay.max(Duration::from_millis(1))
+        // ENOBUFS uses a timer because writable readiness may remain set. Other
+        // blocked sends use readiness. Do not spin on an immediate egress deadline.
+        let delay = match (delay.is_zero(), self.send_retry_at) {
+            (true, Some(retry)) => retry.saturating_duration_since(now),
+            (true, None) if self.device.tx.len() == PACKET_QUEUE => Duration::from_secs(1),
+            _ => delay.max(Duration::from_millis(1)),
         };
         let mut deadline = now + delay;
+        if let Some(retry) = self.send_retry_at {
+            deadline = deadline.min(retry);
+        }
         for resolution in &self.resolutions {
             deadline = deadline.min(resolution.deadline);
         }
@@ -367,33 +379,21 @@ impl Driver {
     }
 
     fn flush_packets(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
-        for _ in 0..WORK_BUDGET {
-            let Some(packet) = self.device.tx.front() else {
-                return Ok(());
-            };
-            match self.tunnel.poll_send_ready(cx) {
-                Poll::Pending => return Ok(()),
-                Poll::Ready(result) => result?,
-            }
-            match self.tunnel.try_send(packet) {
-                Ok(size) if size == packet.len() => {
-                    self.device.tx.pop_front();
+        let tunnel = &self.tunnel;
+        flush_packet_queue(
+            &mut self.device.tx,
+            &mut self.send_retry_at,
+            Instant::now(),
+            cx,
+            |packet, cx| {
+                match tunnel.poll_send_ready(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Ready(Ok(())) => {}
                 }
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "short VPN datagram write",
-                    ));
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        if !self.device.tx.is_empty() {
-            cx.waker().wake_by_ref();
-        }
-        Ok(())
+                Poll::Ready(tunnel.try_send(packet))
+            },
+        )
     }
 
     fn start(&mut self, command: ConnectCommand) {
@@ -825,6 +825,52 @@ impl Driver {
     }
 }
 
+// ENOBUFS can leave a UNIX datagram socket writable (notably on Darwin).
+// Keep the datagram queued and retry on a timer instead of spinning on readiness.
+fn flush_packet_queue(
+    queue: &mut VecDeque<Vec<u8>>,
+    retry_at: &mut Option<Instant>,
+    now: Instant,
+    cx: &mut Context<'_>,
+    mut send: impl FnMut(&[u8], &mut Context<'_>) -> Poll<io::Result<usize>>,
+) -> io::Result<()> {
+    if retry_at.is_some_and(|deadline| now < deadline) {
+        return Ok(());
+    }
+    *retry_at = None;
+    for _ in 0..WORK_BUDGET {
+        let Some(packet) = queue.front() else {
+            return Ok(());
+        };
+        match send(packet, cx) {
+            Poll::Pending => return Ok(()),
+            Poll::Ready(Ok(size)) if size == packet.len() => {
+                queue.pop_front();
+            }
+            Poll::Ready(Ok(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short VPN datagram write",
+                ));
+            }
+            Poll::Ready(Err(error)) if error.raw_os_error() == Some(libc::ENOBUFS) => {
+                *retry_at = Some(now + SEND_RETRY_DELAY);
+                return Ok(());
+            }
+            Poll::Ready(Err(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Poll::Ready(Err(error)) => return Err(error),
+        }
+    }
+    if !queue.is_empty() {
+        cx.waker().wake_by_ref();
+    }
+    Ok(())
+}
+
 fn stopped() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "VPN packet driver stopped")
 }
@@ -1036,13 +1082,25 @@ mod tests {
         }
         let (socket, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
         socket.set_nonblocking(true).unwrap();
-        loop {
+        let mut blocked = false;
+        for _ in 0..65_536 {
             match socket.send(&[0; 1400]) {
                 Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    blocked = true;
+                    break;
+                }
+                // Darwin reports a full UNIX datagram peer queue as ENOBUFS,
+                // rather than EAGAIN. The production retry path is tested separately.
+                #[cfg(target_os = "macos")]
+                Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => {
+                    blocked = true;
+                    break;
+                }
                 Err(error) => panic!("could not fill transport: {error}"),
             }
         }
+        assert!(blocked, "transport did not saturate within the setup limit");
         let (network, mut driver) =
             new(UnixDatagram::from_std(socket).unwrap(), test_config()).unwrap();
         for _ in 0..PACKET_QUEUE {
@@ -1060,6 +1118,183 @@ mod tests {
         );
         assert_eq!(driver.device.rx.len(), 1);
         drop(network);
+    }
+
+    #[tokio::test]
+    async fn enobufs_preserves_packets_and_retries_without_readiness_spin() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::task::{Wake, Waker};
+        struct Counter(AtomicUsize);
+        impl Wake for Counter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        let now = Instant::now();
+        let original = VecDeque::from([vec![1, 2, 3], vec![4, 5]]);
+        let mut queue = original.clone();
+        let mut retry_at = None;
+        // A permanently writable transport must still be tried only once per
+        // backoff interval when its send syscall reports ENOBUFS.
+        for attempt in 0..3 {
+            let now = now + SEND_RETRY_DELAY * attempt;
+            let mut calls = 0;
+            flush_packet_queue(&mut queue, &mut retry_at, now, &mut cx, |_, _| {
+                calls += 1;
+                Poll::Ready(Err(io::Error::from_raw_os_error(libc::ENOBUFS)))
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(retry_at, Some(now + SEND_RETRY_DELAY));
+            assert_eq!(queue, original);
+            flush_packet_queue(
+                &mut queue,
+                &mut retry_at,
+                now + SEND_RETRY_DELAY / 2,
+                &mut cx,
+                |_, _| panic!("must not poll writable readiness before the retry deadline"),
+            )
+            .unwrap();
+            assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+        }
+        let mut sent = Vec::new();
+        flush_packet_queue(
+            &mut queue,
+            &mut retry_at,
+            now + SEND_RETRY_DELAY * 3,
+            &mut cx,
+            |packet, _| {
+                sent.push(packet.to_vec());
+                Poll::Ready(Ok(packet.len()))
+            },
+        )
+        .unwrap();
+        assert_eq!(sent, Vec::from(original));
+        assert!(queue.is_empty());
+        assert_eq!(retry_at, None);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+    }
+
+    struct WakeCounter(std::sync::atomic::AtomicUsize);
+    impl std::task::Wake for WakeCounter {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn wake_counter() -> (std::sync::Arc<WakeCounter>, std::task::Waker) {
+        let counter = std::sync::Arc::new(WakeCounter(Default::default()));
+        (counter.clone(), std::task::Waker::from(counter))
+    }
+
+    fn take_wakes(counter: &WakeCounter) -> usize {
+        counter.0.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Poll until the driver stops requesting an immediate repoll.
+    fn settle(driver: &mut Driver, cx: &mut Context<'_>, counter: &WakeCounter) {
+        for _ in 0..16 {
+            if take_wakes(counter) == 0 {
+                return;
+            }
+            assert!(driver.poll(cx).is_pending());
+        }
+        panic!("driver keeps waking itself");
+    }
+
+    // The paused clock makes the backoff independent of scheduling delays.
+    #[tokio::test(start_paused = true)]
+    async fn send_backoff_keeps_timer_and_connect_cancellation_responsive() {
+        let (socket, peer) = UnixDatagram::pair().unwrap();
+        // A nonblocking std socket reads the queue directly, without readiness.
+        let peer = peer.into_std().unwrap();
+        let (_network, mut driver) = new(socket, test_config()).unwrap();
+        let (reply, response) = oneshot::channel();
+        driver.start(ConnectCommand {
+            target: Target::Ip("10.20.0.3:443".parse().unwrap()),
+            deadline: Instant::now() + Duration::from_secs(30),
+            reply,
+        });
+        assert_eq!(driver.flows.len(), 1);
+        drop(response);
+        driver.send_retry_at = Some(Instant::now() + SEND_RETRY_DELAY);
+        driver.device.tx.push_back(vec![0; 20]);
+        let (counter, waker) = wake_counter();
+        let mut cx = Context::from_waker(&waker);
+        assert!(driver.poll(&mut cx).is_pending());
+        assert!(
+            driver.flows.is_empty(),
+            "backoff must not defer cancellation"
+        );
+        settle(&mut driver, &mut cx, &counter);
+        assert_eq!(driver.device.tx.front().unwrap(), &vec![0; 20]);
+        assert!(peer.recv(&mut [0; 64]).is_err(), "sent before the deadline");
+        tokio::time::advance(SEND_RETRY_DELAY / 2).await;
+        assert_eq!(take_wakes(&counter), 0, "woke before the retry deadline");
+        tokio::time::advance(SEND_RETRY_DELAY / 2).await;
+        assert!(
+            take_wakes(&counter) > 0,
+            "retry deadline must wake the driver"
+        );
+        assert!(driver.poll(&mut cx).is_pending());
+        let mut packet = [0; 64];
+        assert_eq!(peer.recv(&mut packet).unwrap(), 20);
+        assert_eq!(&packet[..20], &[0; 20]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_packets_held_by_send_backoff() {
+        let (socket, peer) = UnixDatagram::pair().unwrap();
+        let peer = peer.into_std().unwrap();
+        let (network, mut driver) = new(socket, test_config()).unwrap();
+        drop(network);
+        driver.send_retry_at = Some(Instant::now() + SEND_RETRY_DELAY);
+        driver.device.tx.push_back(vec![0; 20]);
+        let (counter, waker) = wake_counter();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            driver.poll(&mut cx).is_pending(),
+            "driver finished with a queued packet"
+        );
+        settle(&mut driver, &mut cx, &counter);
+        tokio::time::advance(SEND_RETRY_DELAY).await;
+        assert!(take_wakes(&counter) > 0);
+        assert!(matches!(driver.poll(&mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(peer.recv(&mut [0; 64]).unwrap(), 20);
+    }
+
+    #[test]
+    fn packet_send_fatal_errors_and_short_writes_remain_errors() {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        for result in [Err(io::Error::from_raw_os_error(libc::ECONNREFUSED)), Ok(1)] {
+            let mut queue = VecDeque::from([vec![1, 2, 3]]);
+            let mut retry_at = None;
+            let mut result = Some(result);
+            assert!(
+                flush_packet_queue(
+                    &mut queue,
+                    &mut retry_at,
+                    Instant::now(),
+                    &mut cx,
+                    |_, _| { Poll::Ready(result.take().unwrap()) }
+                )
+                .is_err()
+            );
+            assert_eq!(queue, VecDeque::from([vec![1, 2, 3]]));
+            assert!(retry_at.is_none());
+        }
     }
 
     #[tokio::test]
