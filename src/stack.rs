@@ -6,7 +6,7 @@ use std::{
     collections::{BTreeSet, VecDeque},
     future::{Future, poll_fn},
     io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -34,8 +34,9 @@ const SEND_RETRY_DELAY: Duration = Duration::from_millis(10);
 const FIRST_EPHEMERAL: u16 = 49152;
 const EPHEMERAL_COUNT: u32 = 16384;
 const MAX_DATAGRAM: usize = 65_535;
-/// smoltcp's fixed TIME-WAIT duration. A reclaimed TIME-WAIT connection keeps
-/// its source port reserved this long so its tuple cannot be reused early.
+/// smoltcp's TIME-WAIT duration. A reclaimed tuple stays reserved until the
+/// socket would have left TIME-WAIT: this long after entry, and this long
+/// after each later segment that restarts the timer.
 const TIME_WAIT: Duration = Duration::from_secs(10);
 
 /// A completed VPN TCP connection and its actual VPN-side local endpoint.
@@ -101,6 +102,15 @@ struct Flow {
     local_eof: bool,
     remote_eof: bool,
     close_deadline: Option<Instant>,
+    /// When smoltcp's TIME-WAIT timer expires. Set on entry and moved forward
+    /// if an incoming segment restarts that timer.
+    time_wait_until: Option<Instant>,
+}
+
+struct QuarantinedTuple {
+    expires: Instant,
+    port: u16,
+    remote: SocketAddr,
 }
 
 /// Drives packets, timers, DNS queries, and application backpressure.
@@ -119,8 +129,9 @@ pub struct Driver {
     resolutions: Vec<Resolution>,
     flows: Vec<Flow>,
     used_ports: BTreeSet<u16>,
-    /// Ports of reclaimed TIME-WAIT connections, in expiry order.
-    quarantined_ports: VecDeque<(Instant, u16)>,
+    /// Reclaimed TIME-WAIT tuples. A local port stays blocked only for the
+    /// remote it was connected to, and only until that socket's deadline.
+    quarantined_ports: VecDeque<QuarantinedTuple>,
     epoch: Instant,
     timer: Pin<Box<Sleep>>,
     receive_buffer: Vec<u8>,
@@ -274,6 +285,9 @@ impl Driver {
         let stack_now = self.stack_now();
         self.flush_packets(cx)?;
         self.receive_packets(cx)?;
+        // A segment already queued for a TIME-WAIT socket restarts its timer
+        // inside the poll below. Record that before a new connect can reclaim it.
+        self.note_time_wait_segments(now);
         for _ in 0..WORK_BUDGET {
             match self.commands.poll_recv(cx) {
                 Poll::Ready(Some(command)) => self.start(command),
@@ -405,15 +419,8 @@ impl Driver {
         if reply.is_closed() {
             return;
         }
-        if self.flows.len() + self.resolutions.len() >= self.config.max_connections
-            && !self.reclaim_time_wait()
-        {
-            let _ = reply.send(Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "VPN connection limit reached",
-            )));
-            return;
-        }
+        // These checks do not need a free slot. Failing them must not abort a
+        // TIME-WAIT socket whose peer is still reachable.
         if deadline <= Instant::now() {
             let _ = reply.send(Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -428,8 +435,30 @@ impl Driver {
             )));
             return;
         }
+        let limit = || io::Error::new(io::ErrorKind::WouldBlock, "VPN connection limit reached");
+        let at_limit = self.flows.len() + self.resolutions.len() >= self.config.max_connections;
+        if at_limit && self.reclaimable_index().is_none() {
+            let _ = reply.send(Err(limit()));
+            return;
+        }
         match target {
-            Target::Ip(address) => self.start_tcp(vec![address], deadline, reply),
+            Target::Ip(address) => {
+                // Build the socket before reclaiming. A refused address or a
+                // spent port then leaves the old TIME-WAIT peer in place.
+                let (socket, local_addr) = match self.connect_socket(address) {
+                    Ok(connected) => connected,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return;
+                    }
+                };
+                if at_limit && !self.reclaim_time_wait() {
+                    self.used_ports.remove(&local_addr.port());
+                    let _ = reply.send(Err(limit()));
+                    return;
+                }
+                self.push_flow(socket, local_addr, VecDeque::new(), deadline, reply);
+            }
             Target::Domain(name, port) => {
                 let name = match qualify_name(&name, self.config.domain.as_deref()) {
                     Ok(name) => name,
@@ -445,26 +474,17 @@ impl Driver {
                     )));
                     return;
                 }
-                let mut queries = Vec::with_capacity(2);
-                let query_types = [
-                    self.config.ipv4.map(|_| DnsQueryType::A),
-                    self.config.ipv6.map(|_| DnsQueryType::Aaaa),
-                ];
-                let socket = self.sockets.get_mut::<dns::Socket>(self.dns);
-                for query_type in query_types.into_iter().flatten() {
-                    match socket.start_query(self.iface.context(), &name, query_type) {
-                        Ok(query) => queries.push(query),
-                        Err(error) => {
-                            for query in queries {
-                                socket.cancel_query(query);
-                            }
-                            let _ = reply.send(Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                error.to_string(),
-                            )));
-                            return;
-                        }
+                let queries = match self.start_dns_queries(&name) {
+                    Ok(queries) => queries,
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                        return;
                     }
+                };
+                if at_limit && !self.reclaim_time_wait() {
+                    self.cancel_dns_queries(&queries);
+                    let _ = reply.send(Err(limit()));
+                    return;
                 }
                 self.resolutions.push(Resolution {
                     queries,
@@ -476,30 +496,121 @@ impl Driver {
         }
     }
 
-    /// A connection we closed first stays in TIME-WAIT for smoltcp's fixed 10 s.
-    /// It has delivered everything to its client but still holds a connection
-    /// slot and its buffers. Only at the limit, release the earliest-opened such
-    /// connection instead of refusing new work, as lwIP does. The total socket
-    /// count and memory bound are unchanged. Its source port stays reserved for
-    /// the rest of TIME-WAIT, so a new connection cannot reuse the tuple. If the
-    /// peer lost our final ACK, its retransmitted FIN now gets a reset, which
-    /// ends its LAST-ACK state just as the ACK would have.
-    fn reclaim_time_wait(&mut self) -> bool {
+    fn start_dns_queries(&mut self, name: &str) -> io::Result<Vec<dns::QueryHandle>> {
+        let mut queries = Vec::with_capacity(2);
+        let query_types = [
+            self.config.ipv4.map(|_| DnsQueryType::A),
+            self.config.ipv6.map(|_| DnsQueryType::Aaaa),
+        ];
+        let socket = self.sockets.get_mut::<dns::Socket>(self.dns);
+        for query_type in query_types.into_iter().flatten() {
+            match socket.start_query(self.iface.context(), name, query_type) {
+                Ok(query) => queries.push(query),
+                Err(error) => {
+                    for query in queries {
+                        socket.cancel_query(query);
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        error.to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(queries)
+    }
+
+    fn cancel_dns_queries(&mut self, queries: &[dns::QueryHandle]) {
+        let socket = self.sockets.get_mut::<dns::Socket>(self.dns);
+        for query in queries {
+            socket.cancel_query(*query);
+        }
+    }
+
+    fn reclaimable_index(&self) -> Option<usize> {
         let sockets = &self.sockets;
-        let Some(index) = self.flows.iter().position(|flow| {
+        self.flows.iter().position(|flow| {
             let socket = sockets.get::<tcp::Socket>(flow.handle);
             flow.reply.is_none()
                 && flow.remote_eof
                 && socket.state() == tcp::State::TimeWait
                 && !socket.can_recv()
-        }) else {
+        })
+    }
+
+    /// The earliest-opened TIME-WAIT flow has delivered its data. At the limit,
+    /// release it so a connection that is ready to occupy the slot can proceed,
+    /// as lwIP does. The socket set does not grow. The source port stays
+    /// reserved for that remote tuple until the socket's own TIME-WAIT deadline,
+    /// and another tuple may use the port immediately. If the peer lost our
+    /// final ACK, its retransmitted FIN now gets a reset, which ends its
+    /// LAST-ACK state just as the ACK would have.
+    fn reclaim_time_wait(&mut self) -> bool {
+        let Some(index) = self.reclaimable_index() else {
             return false;
         };
+        let handle = self.flows[index].handle;
+        let remote = SocketAddr::from(
+            self.sockets
+                .get::<tcp::Socket>(handle)
+                .remote_endpoint()
+                .expect("TIME-WAIT socket has a remote endpoint"),
+        );
         let flow = self.flows.remove(index);
+        let expires = flow
+            .time_wait_until
+            .expect("TIME-WAIT flow records its deadline");
+        let port = flow.local_addr.port();
         self.sockets.remove(flow.handle);
-        self.quarantined_ports
-            .push_back((Instant::now() + TIME_WAIT, flow.local_addr.port()));
+        self.used_ports.remove(&port);
+        self.quarantined_ports.push_back(QuarantinedTuple {
+            expires,
+            port,
+            remote,
+        });
         true
+    }
+
+    /// smoltcp restarts TIME-WAIT when a segment arrives for a socket already
+    /// in that state. Extend our deadline to match before the socket can be
+    /// reclaimed and the segment answered with a reset instead.
+    fn note_time_wait_segments(&mut self, now: Instant) {
+        let restart_at = now + TIME_WAIT;
+        let queued: Vec<(SocketAddr, SocketAddr)> = self
+            .device
+            .rx
+            .iter()
+            .filter_map(|packet| tcp_endpoints(packet))
+            .collect();
+        if queued.is_empty() {
+            return;
+        }
+        let sockets = &self.sockets;
+        let matched: Vec<usize> = self
+            .flows
+            .iter()
+            .enumerate()
+            .filter(|(_, flow)| {
+                let socket = sockets.get::<tcp::Socket>(flow.handle);
+                if socket.state() != tcp::State::TimeWait {
+                    return false;
+                }
+                let Some(remote) = socket.remote_endpoint().map(SocketAddr::from) else {
+                    return false;
+                };
+                queued.iter().any(|&(source, destination)| {
+                    source == remote && destination == flow.local_addr
+                })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in matched {
+            let flow = &mut self.flows[index];
+            flow.time_wait_until = Some(
+                flow.time_wait_until
+                    .map_or(restart_at, |deadline| deadline.max(restart_at)),
+            );
+        }
     }
 
     fn resolve(&mut self, cx: &mut Context<'_>, now: Instant) {
@@ -559,23 +670,27 @@ impl Driver {
         }
     }
 
-    fn allocate_port(&mut self) -> io::Result<u16> {
+    fn allocate_port(&mut self, remote: SocketAddr) -> io::Result<u16> {
         let now = Instant::now();
-        while let Some(&(expiry, port)) = self.quarantined_ports.front() {
-            if expiry > now {
-                break;
-            }
-            self.quarantined_ports.pop_front();
-            self.used_ports.remove(&port);
-        }
+        // Deadlines are not ordered: a later flow can enter TIME-WAIT first,
+        // and a segment can restart one deadline without the others.
+        self.quarantined_ports.retain(|entry| entry.expires > now);
+        let blocked: BTreeSet<u16> = self
+            .quarantined_ports
+            .iter()
+            .filter(|entry| entry.remote == remote)
+            .map(|entry| entry.port)
+            .collect();
         let mut random = [0; 2];
         getrandom::fill(&mut random).map_err(|error| io::Error::other(error.to_string()))?;
         let start = u16::from_ne_bytes(random) as u32 % EPHEMERAL_COUNT;
         for offset in 0..EPHEMERAL_COUNT {
             let port = FIRST_EPHEMERAL + ((start + offset) % EPHEMERAL_COUNT) as u16;
-            if self.used_ports.insert(port) {
-                return Ok(port);
+            if self.used_ports.contains(&port) || blocked.contains(&port) {
+                continue;
             }
+            self.used_ports.insert(port);
+            return Ok(port);
         }
         Err(io::Error::new(
             io::ErrorKind::AddrNotAvailable,
@@ -607,7 +722,7 @@ impl Driver {
                 "destination must be a unicast address",
             ));
         }
-        let port = self.allocate_port()?;
+        let port = self.allocate_port(remote)?;
         let local = SocketAddr::new(source, port);
         if let Err(error) = socket.connect(
             self.iface.context(),
@@ -627,22 +742,26 @@ impl Driver {
         Ok(local)
     }
 
-    fn start_tcp(&mut self, addresses: Vec<SocketAddr>, deadline: Instant, reply: ConnectReply) {
-        let mut alternatives: VecDeque<_> = addresses.into();
-        let Some(address) = alternatives.pop_front() else {
-            return;
-        };
+    fn connect_socket(
+        &mut self,
+        remote: SocketAddr,
+    ) -> io::Result<(tcp::Socket<'static>, SocketAddr)> {
         let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; self.config.buffer_size]),
             tcp::SocketBuffer::new(vec![0; self.config.buffer_size]),
         );
-        let local_addr = match self.open_tcp(&mut socket, address) {
-            Ok(local) => local,
-            Err(error) => {
-                let _ = reply.send(Err(error));
-                return;
-            }
-        };
+        let local_addr = self.open_tcp(&mut socket, remote)?;
+        Ok((socket, local_addr))
+    }
+
+    fn push_flow(
+        &mut self,
+        socket: tcp::Socket<'static>,
+        local_addr: SocketAddr,
+        alternatives: VecDeque<SocketAddr>,
+        deadline: Instant,
+        reply: ConnectReply,
+    ) {
         let handle = self.sockets.add(socket);
         let (client, bridge) = tokio::io::duplex(self.config.buffer_size);
         self.flows.push(Flow {
@@ -657,7 +776,23 @@ impl Driver {
             local_eof: false,
             remote_eof: false,
             close_deadline: None,
+            time_wait_until: None,
         });
+    }
+
+    fn start_tcp(&mut self, addresses: Vec<SocketAddr>, deadline: Instant, reply: ConnectReply) {
+        let mut alternatives: VecDeque<_> = addresses.into();
+        let Some(address) = alternatives.pop_front() else {
+            return;
+        };
+        let (socket, local_addr) = match self.connect_socket(address) {
+            Ok(connected) => connected,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return;
+            }
+        };
+        self.push_flow(socket, local_addr, alternatives, deadline, reply);
     }
 
     fn retry(&mut self, flow: &mut Flow) -> io::Result<bool> {
@@ -696,6 +831,13 @@ impl Driver {
         let flows = std::mem::take(&mut self.flows);
         for mut flow in flows {
             let mut remove = false;
+            if self.sockets.get::<tcp::Socket>(flow.handle).state() == tcp::State::TimeWait
+                && flow.time_wait_until.is_none()
+            {
+                // `now` is the same instant passed to smoltcp for this poll, which
+                // is when the close timer was armed.
+                flow.time_wait_until = Some(now + TIME_WAIT);
+            }
             if let Some(reply) = flow.reply.as_mut() {
                 if reply.poll_closed(cx).is_ready() {
                     remove = true;
@@ -901,6 +1043,40 @@ fn qualify_name(name: &str, domain: Option<&str>) -> io::Result<String> {
     Ok(qualified)
 }
 
+/// Source and destination of a TCP segment carried directly in IPv4 or IPv6.
+/// Extension headers and fragments are ignored; those segments are not used
+/// to restart a TIME-WAIT deadline.
+fn tcp_endpoints(packet: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
+    let (source, destination, segment) = match packet.first().copied().map(|byte| byte >> 4) {
+        Some(4) if packet.len() >= 24 => {
+            let header = usize::from(packet[0] & 0x0f) * 4;
+            if header < 20 || packet.len() < header + 4 || packet[9] != 6 {
+                return None;
+            }
+            let source = IpAddr::V4(Ipv4Addr::new(
+                packet[12], packet[13], packet[14], packet[15],
+            ));
+            let destination = IpAddr::V4(Ipv4Addr::new(
+                packet[16], packet[17], packet[18], packet[19],
+            ));
+            (source, destination, &packet[header..])
+        }
+        Some(6) if packet.len() >= 44 && packet[6] == 6 => {
+            let source = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).ok()?));
+            let destination =
+                IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?));
+            (source, destination, &packet[40..])
+        }
+        _ => return None,
+    };
+    let source_port = u16::from_be_bytes(segment.get(..2)?.try_into().ok()?);
+    let destination_port = u16::from_be_bytes(segment.get(2..4)?.try_into().ok()?);
+    Some((
+        SocketAddr::new(source, source_port),
+        SocketAddr::new(destination, destination_port),
+    ))
+}
+
 fn valid_ip_packet(packet: &[u8]) -> bool {
     match packet.first().map(|byte| byte >> 4) {
         Some(4) if packet.len() >= 20 => {
@@ -978,6 +1154,7 @@ impl TxToken for TransmitPacket<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn suffix_applies_only_to_unqualified_names() {
@@ -999,21 +1176,26 @@ mod tests {
         let (vpn, _peer) = UnixDatagram::pair().unwrap();
         let (_network, mut driver) = new(vpn, test_config()).unwrap();
         let reclaimed = FIRST_EPHEMERAL + 7;
-        driver.used_ports.insert(reclaimed);
-        driver
-            .quarantined_ports
-            .push_back((Instant::now() + TIME_WAIT, reclaimed));
+        let same: SocketAddr = "10.20.0.42:80".parse().unwrap();
+        let other: SocketAddr = "10.20.0.43:80".parse().unwrap();
+        driver.quarantined_ports.push_back(QuarantinedTuple {
+            expires: Instant::now() + TIME_WAIT,
+            port: reclaimed,
+            remote: same,
+        });
         let mut allocated = BTreeSet::new();
         for _ in 1..EPHEMERAL_COUNT {
-            allocated.insert(driver.allocate_port().unwrap());
+            allocated.insert(driver.allocate_port(same).unwrap());
         }
         assert!(!allocated.contains(&reclaimed));
         assert_eq!(
-            driver.allocate_port().unwrap_err().kind(),
+            driver.allocate_port(same).unwrap_err().kind(),
             io::ErrorKind::AddrNotAvailable
         );
-        driver.quarantined_ports[0].0 = Instant::now();
-        assert_eq!(driver.allocate_port().unwrap(), reclaimed);
+        assert_eq!(driver.allocate_port(other).unwrap(), reclaimed);
+        driver.used_ports.remove(&reclaimed);
+        driver.quarantined_ports[0].expires = Instant::now();
+        assert_eq!(driver.allocate_port(same).unwrap(), reclaimed);
         assert!(driver.quarantined_ports.is_empty());
     }
 
@@ -1311,5 +1493,407 @@ mod tests {
                 matches!(new(socket, config), Err(error) if error.kind() == io::ErrorKind::InvalidInput)
             );
         }
+    }
+
+    struct TimeWaitSession {
+        _network: Network,
+        driver: Driver,
+        peer: std::os::unix::net::UnixDatagram,
+        local: SocketAddr,
+        remote: SocketAddr,
+        server_fin_seq: u32,
+        ack_of_fin: u32,
+        _stream: DuplexStream,
+    }
+
+    impl TimeWaitSession {
+        async fn establish() -> Self {
+            let (socket, peer) = UnixDatagram::pair().unwrap();
+            let peer = peer.into_std().unwrap();
+            let mut config = test_config();
+            config.max_connections = 1;
+            let (network, mut driver) = new(socket, config).unwrap();
+            let remote: SocketAddr = "10.20.0.42:7007".parse().unwrap();
+            let (reply, mut response) = oneshot::channel();
+            driver.start(ConnectCommand {
+                target: Target::Ip(remote),
+                deadline: Instant::now() + Duration::from_secs(30),
+                reply,
+            });
+            drive(&mut driver);
+            let packets = drain(&peer);
+            let syn = packets
+                .iter()
+                .find(|packet| tcp_flags(packet) & 0x02 != 0)
+                .expect("SYN");
+            let (local, got_remote, segment) = ipv4_endpoints(syn);
+            assert_eq!(got_remote, remote);
+            let client_isn = u32_at(segment, 4);
+            let server_isn = 0x5000u32;
+            // Inbound datagrams are queued on the device. The test polls the
+            // driver with its own waker, so tunnel readiness is not observed.
+            driver.device.rx.push_back(ipv4_tcp(
+                remote,
+                local,
+                server_isn,
+                client_isn.wrapping_add(1),
+                0x12,
+            ));
+            drive(&mut driver);
+            let mut connected = response
+                .try_recv()
+                .expect("handshake produced no reply")
+                .expect("handshake failed");
+            assert_eq!(connected.local_addr, local);
+            let _ = drain(&peer);
+            connected.stream.shutdown().await.unwrap();
+            let mut ack_of_fin = client_isn.wrapping_add(1);
+            let mut saw_fin = false;
+            for _ in 0..8 {
+                drive(&mut driver);
+                for packet in drain(&peer) {
+                    let (_, _, segment) = ipv4_endpoints(&packet);
+                    let seq = u32_at(segment, 4);
+                    let data_offset = usize::from(segment[12] >> 4) * 4;
+                    let mut advance = (segment.len() - data_offset) as u32;
+                    if segment[13] & 0x02 != 0 {
+                        advance = advance.wrapping_add(1);
+                    }
+                    if segment[13] & 0x01 != 0 {
+                        advance = advance.wrapping_add(1);
+                        saw_fin = true;
+                    }
+                    if advance > 0 {
+                        ack_of_fin = seq.wrapping_add(advance);
+                    }
+                }
+                if saw_fin {
+                    break;
+                }
+            }
+            assert!(saw_fin, "active close did not send a FIN");
+            driver.device.rx.push_back(ipv4_tcp(
+                remote,
+                local,
+                server_isn.wrapping_add(1),
+                ack_of_fin,
+                0x11,
+            ));
+            let mut session = Self {
+                _network: network,
+                driver,
+                peer,
+                local,
+                remote,
+                server_fin_seq: server_isn.wrapping_add(1),
+                ack_of_fin,
+                _stream: connected.stream,
+            };
+            for _ in 0..6 {
+                session.drive();
+                let _ = session.drain();
+                if session.reclaimable() {
+                    return session;
+                }
+            }
+            panic!(
+                "handshake did not reach reclaimable TIME-WAIT: {}",
+                session.debug_state()
+            );
+        }
+
+        fn drive(&mut self) {
+            drive(&mut self.driver);
+        }
+
+        fn drain(&self) -> Vec<Vec<u8>> {
+            drain(&self.peer)
+        }
+
+        fn reclaimable(&self) -> bool {
+            let Some(flow) = self.driver.flows.first() else {
+                return false;
+            };
+            let socket = self.driver.sockets.get::<tcp::Socket>(flow.handle);
+            flow.reply.is_none()
+                && flow.remote_eof
+                && socket.state() == tcp::State::TimeWait
+                && !socket.can_recv()
+        }
+
+        fn debug_state(&self) -> String {
+            let Some(flow) = self.driver.flows.first() else {
+                return "no flow".to_owned();
+            };
+            let socket = self.driver.sockets.get::<tcp::Socket>(flow.handle);
+            format!(
+                "state {:?} reply {} remote_eof {} can_recv {} flows {}",
+                socket.state(),
+                flow.reply.is_some(),
+                flow.remote_eof,
+                socket.can_recv(),
+                self.driver.flows.len()
+            )
+        }
+    }
+
+    fn drive(driver: &mut Driver) {
+        let (counter, waker) = wake_counter();
+        let mut cx = Context::from_waker(&waker);
+        assert!(driver.poll(&mut cx).is_pending(), "driver stopped");
+        settle(driver, &mut cx, &counter);
+    }
+
+    fn drain(peer: &std::os::unix::net::UnixDatagram) -> Vec<Vec<u8>> {
+        let mut packets = Vec::new();
+        let mut buffer = [0; 65536];
+        loop {
+            match peer.recv(&mut buffer) {
+                Ok(size) => packets.push(buffer[..size].to_vec()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => panic!("peer recv: {error}"),
+            }
+        }
+        packets
+    }
+
+    fn tcp_flags(packet: &[u8]) -> u8 {
+        ipv4_endpoints(packet).2[13]
+    }
+
+    fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn ipv4_endpoints(packet: &[u8]) -> (SocketAddr, SocketAddr, &[u8]) {
+        assert_eq!(packet[0] >> 4, 4);
+        let source = IpAddr::V4(std::net::Ipv4Addr::from(
+            <[u8; 4]>::try_from(&packet[12..16]).unwrap(),
+        ));
+        let destination = IpAddr::V4(std::net::Ipv4Addr::from(
+            <[u8; 4]>::try_from(&packet[16..20]).unwrap(),
+        ));
+        let segment = &packet[20..];
+        (
+            SocketAddr::new(source, u16::from_be_bytes(segment[..2].try_into().unwrap())),
+            SocketAddr::new(
+                destination,
+                u16::from_be_bytes(segment[2..4].try_into().unwrap()),
+            ),
+            segment,
+        )
+    }
+
+    fn ipv4_checksum(bytes: &[u8]) -> u16 {
+        let mut sum: u32 = bytes
+            .chunks(2)
+            .map(|word| u16::from_be_bytes([word[0], *word.get(1).unwrap_or(&0)]) as u32)
+            .sum();
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    fn ipv4_tcp(source: SocketAddr, dest: SocketAddr, seq: u32, ack: u32, flags: u8) -> Vec<u8> {
+        let mut tcp = vec![0; 20];
+        tcp[..2].copy_from_slice(&source.port().to_be_bytes());
+        tcp[2..4].copy_from_slice(&dest.port().to_be_bytes());
+        tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+        tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+        tcp[12] = 0x50;
+        tcp[13] = flags;
+        tcp[14..16].copy_from_slice(&32_768u16.to_be_bytes());
+        let IpAddr::V4(source_ip) = source.ip() else {
+            unreachable!("test peer is IPv4");
+        };
+        let IpAddr::V4(dest_ip) = dest.ip() else {
+            unreachable!("test peer is IPv4");
+        };
+        let mut pseudo = Vec::with_capacity(12 + tcp.len());
+        pseudo.extend(source_ip.octets());
+        pseudo.extend(dest_ip.octets());
+        pseudo.extend([0, 6]);
+        pseudo.extend((tcp.len() as u16).to_be_bytes());
+        pseudo.extend(&tcp);
+        let sum = ipv4_checksum(&pseudo);
+        tcp[16..18].copy_from_slice(&sum.to_be_bytes());
+        let mut packet = vec![0; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&((tcp.len() + 20) as u16).to_be_bytes());
+        packet[6] = 0x40;
+        packet[8] = 64;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&source_ip.octets());
+        packet[16..20].copy_from_slice(&dest_ip.octets());
+        let sum = ipv4_checksum(&packet);
+        packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        packet.extend(tcp);
+        packet
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_connect_does_not_reset_time_wait_peer() {
+        let mut session = TimeWaitSession::establish().await;
+        let handle = session.driver.flows[0].handle;
+        let rejections = [
+            (
+                Target::Ip("10.20.0.50:0".parse().unwrap()),
+                Instant::now() + Duration::from_secs(5),
+                io::ErrorKind::InvalidInput,
+            ),
+            (
+                Target::Ip("10.20.0.50:80".parse().unwrap()),
+                Instant::now(),
+                io::ErrorKind::TimedOut,
+            ),
+            (
+                Target::Domain(String::new(), 80),
+                Instant::now() + Duration::from_secs(5),
+                io::ErrorKind::InvalidInput,
+            ),
+            (
+                Target::Domain("example.com".into(), 80),
+                Instant::now() + Duration::from_secs(5),
+                io::ErrorKind::NotFound,
+            ),
+            (
+                Target::Ip("224.0.0.1:80".parse().unwrap()),
+                Instant::now() + Duration::from_secs(5),
+                io::ErrorKind::InvalidInput,
+            ),
+            (
+                Target::Ip("[2001:db8::5]:443".parse().unwrap()),
+                Instant::now() + Duration::from_secs(5),
+                io::ErrorKind::Unsupported,
+            ),
+        ];
+        for (target, deadline, kind) in rejections {
+            let (reply, mut response) = oneshot::channel();
+            session.driver.start(ConnectCommand {
+                target,
+                deadline,
+                reply,
+            });
+            assert_eq!(response.try_recv().unwrap().unwrap_err().kind(), kind);
+            assert_eq!(
+                session.driver.flows.len(),
+                1,
+                "rejected connect removed the TIME-WAIT flow"
+            );
+            assert_eq!(session.driver.flows[0].handle, handle);
+            assert!(session.reclaimable());
+        }
+        let keep = session.local.port();
+        for offset in 0..EPHEMERAL_COUNT {
+            session
+                .driver
+                .used_ports
+                .insert(FIRST_EPHEMERAL + offset as u16);
+        }
+        let (reply, mut response) = oneshot::channel();
+        session.driver.start(ConnectCommand {
+            target: Target::Ip("10.20.0.50:80".parse().unwrap()),
+            deadline: Instant::now() + Duration::from_secs(5),
+            reply,
+        });
+        assert_eq!(
+            response.try_recv().unwrap().unwrap_err().kind(),
+            io::ErrorKind::AddrNotAvailable
+        );
+        assert_eq!(session.driver.flows.len(), 1);
+        assert_eq!(session.driver.flows[0].handle, handle);
+        session.driver.used_ports.retain(|port| *port == keep);
+
+        let (reply, mut response) = oneshot::channel();
+        session.driver.start(ConnectCommand {
+            target: Target::Ip("10.20.0.50:80".parse().unwrap()),
+            deadline: Instant::now() + Duration::from_secs(5),
+            reply,
+        });
+        assert!(
+            response.try_recv().is_err(),
+            "a valid connect at the limit must reclaim TIME-WAIT and stay pending"
+        );
+        assert_eq!(session.driver.flows.len(), 1);
+        assert_ne!(session.driver.flows[0].local_addr.port(), keep);
+        assert_eq!(
+            session
+                .driver
+                .sockets
+                .get::<tcp::Socket>(session.driver.flows[0].handle)
+                .state(),
+            tcp::State::SynSent
+        );
+        assert!(
+            session
+                .driver
+                .quarantined_ports
+                .iter()
+                .any(|entry| entry.port == keep && entry.remote == session.remote)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reclaimed_port_keeps_the_original_time_wait_deadline() {
+        let mut session = TimeWaitSession::establish().await;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(session.driver.reclaim_time_wait());
+        let expires = session.driver.quarantined_ports[0].expires;
+        let remaining = expires.saturating_duration_since(Instant::now());
+        assert_eq!(
+            remaining,
+            Duration::from_secs(1),
+            "quarantine restarted TIME-WAIT ({remaining:?} left)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_time_wait_segment_restarts_the_quarantine_deadline() {
+        let mut session = TimeWaitSession::establish().await;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        session.driver.device.rx.push_back(ipv4_tcp(
+            session.remote,
+            session.local,
+            session.server_fin_seq,
+            session.ack_of_fin,
+            0x11,
+        ));
+        session.drive();
+        assert!(session.reclaimable());
+        assert!(session.driver.reclaim_time_wait());
+        let remaining = session.driver.quarantined_ports[0]
+            .expires
+            .saturating_duration_since(Instant::now());
+        assert_eq!(remaining, TIME_WAIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reclaimed_port_is_reusable_for_a_distinct_tuple() {
+        let mut session = TimeWaitSession::establish().await;
+        let port = session.local.port();
+        for offset in 0..EPHEMERAL_COUNT {
+            session
+                .driver
+                .used_ports
+                .insert(FIRST_EPHEMERAL + offset as u16);
+        }
+        assert!(session.driver.reclaim_time_wait());
+        assert_eq!(
+            session
+                .driver
+                .allocate_port(session.remote)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrNotAvailable,
+            "the reclaimed tuple must stay reserved"
+        );
+        let other: SocketAddr = "10.9.9.9:443".parse().unwrap();
+        assert_eq!(
+            session.driver.allocate_port(other).ok(),
+            Some(port),
+            "a distinct destination must be able to reuse reclaimed port {port}"
+        );
     }
 }
